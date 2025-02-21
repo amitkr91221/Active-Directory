@@ -534,6 +534,30 @@ def check_ad_misconfigurations(server_url, username, password):
         except Exception as e:
             print(f"[!] Unexpected Error: {e}")
 
+        # 18. Check 18 DNS Security Assessment (DNSSEC)
+        print("\n[Check 18] Evaluating DNSSEC Implementation for DNS Security...")
+        try:
+            # Get the list of DNS zones
+            zones = subprocess.check_output(['powershell.exe', '-Command', 'Get-DnsServerZone | Select-Object -ExpandProperty ZoneName'], text=True)
+            zones = zones.splitlines()
+
+            if not zones:
+                print("[!] No DNS zones found on the server.")
+            else:
+                for zone in zones:
+                    print(f"\n[+] Evaluating DNSSEC for Zone: {zone}")
+                    # Check if DNSSEC is enabled for each zone
+                    dnssec_status = subprocess.check_output(['powershell.exe', '-Command', f'Get-DnsServerDnsSecZoneSetting -ZoneName {zone}'], text=True)
+                    if "ZoneSigningKey" in dnssec_status and "KeyMaster" in dnssec_status:
+                        print(f"[+] DNSSEC is enabled for zone: {zone}")
+                    else:
+                        print(f"[!] DNSSEC is NOT enabled for zone: {zone}")
+
+        except subprocess.CalledProcessError as e:
+            print(f"[!] Error while evaluating DNSSEC: {e}")
+        except Exception as e:
+            print(f"[!] Unexpected error during DNSSEC assessment: {e}")
+
         conn.unbind()
 
     except Exception as e:
