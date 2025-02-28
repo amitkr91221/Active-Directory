@@ -1,10 +1,12 @@
 import re
+import os
 import ldap3
 import datetime
 from ldap3 import Server, Connection, ALL, SUBTREE
 import argparse
 import subprocess
 import winreg
+import configparser
 import json
 import win32evtlog
 import xml.etree.ElementTree as ET
@@ -113,36 +115,39 @@ def check_ad_misconfigurations(server_url, username, password):
             print("[+] No expired or inactive accounts found.")
 
         # 6. Check for LLMNR Poisoning Risk
-        print("\n[Check 6] Checking for LLMNR status...")
+        print("\n[Check 6] Checking for LLMNR status via Group Policy...")
         try:
-            # PowerShell command to query LLMNR status from the registry
+            # Use PowerShell to query the registry key for LLMNR
             result = subprocess.run(
-                ['powershell', '-Command', "Get-ItemProperty -Path 'HKLM:\\SOFTWARE\\Policies\\Microsoft\\Windows NT\\DNSClient' -Name 'EnableMulticast'"],
+                ['powershell', '-Command',
+                r"Get-ItemProperty -Path 'HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\DNSClient' -Name 'EnableMulticast'"],
                 capture_output=True,
                 text=True
             )
 
             if result.returncode == 0:
                 output = result.stdout.strip()
-                print("[+] LLMNR Configuration Retrieved:")
-                print(output)
-
-                # Check if 'EnableMulticast' is present in the output
-                if 'EnableMulticast' in output:
-                    # Extract the value of EnableMulticast
-                    value_line = [line for line in output.splitlines() if 'EnableMulticast' in line]
-                    if value_line:
-                        enable_multicast = int(value_line[0].split()[-1])
-                        if enable_multicast == 0:
-                            print("[+] LLMNR is disabled. This mitigates poisoning risks.")
-                        else:
-                            print("[!] LLMNR is enabled. Consider disabling it to reduce poisoning risks.")
+                if "EnableMulticast" in output:
+                    # Parse the value of EnableMulticast
+                    for line in output.splitlines():
+                        if "EnableMulticast" in line:
+                            value = line.split(":")[1].strip()
+                            if value == "0":
+                                print("[+] LLMNR is disabled (via Group Policy).")
+                            elif value == "1":
+                                print("[!] LLMNR is enabled (via Group Policy).")
+                            else:
+                                print(f"[!] Unexpected value for EnableMulticast: {value}")
+                            break
                 else:
-                    print("[!] LLMNR setting not found. It might not be configured explicitly.")
+                    print("[!] LLMNR is not configured via Group Policy.")
             else:
-                print(f"[!] Failed to retrieve LLMNR status. Error: {result.stderr.strip()}")
+                if "Cannot find path" in result.stderr:
+                    print("[!] LLMNR is not configured via Group Policy.")
+                else:
+                    print("[!] LLMNR registry key not found. LLMNR is likely enabled by default.")
         except Exception as e:
-            print(f"[!] Error while checking LLMNR status: {e}")
+            print(f"[!] Error checking LLMNR status via Group Policy: {e}")
 
 
         # 7. Check for SMB Signing Enforcement
@@ -397,8 +402,23 @@ def check_ad_misconfigurations(server_url, username, password):
 
         # Check 15: Kerberos Maximum Ticket Age Configuration
         print("\n[Check 15] Assessing the Maximum Kerberos Ticket Lifetime...")
-
         try:
+            # Generate a GPO report in XML format for the "Default Domain Policy"
+            powershell_command = (
+                'Get-GPOReport -Name "Default Domain Policy" -ReportType XML -Path "C:\\KerberosPolicy.xml"'
+            )
+
+            result = subprocess.run(
+                ["powershell", "-Command", powershell_command],
+                capture_output=True,
+                text=True
+            )
+
+            if result.returncode != 0:
+                print("[!] Error generating GPO report using PowerShell.")
+                print(result.stderr.strip())
+                return
+
             # Load the GPO XML file
             xml_file_path = "C:\\KerberosPolicy.xml"
             tree = ET.parse(xml_file_path)
@@ -486,7 +506,7 @@ def check_ad_misconfigurations(server_url, username, password):
 
         except Exception as e:
             print(f"[!] Unexpected Error: {e}")
-
+            
 
         # 17. Check 17: User Ticket Encryption Enforcement
         print("\n[Check 17] Verifying User Ticket Encryption Enforcement...")
@@ -496,7 +516,6 @@ def check_ad_misconfigurations(server_url, username, password):
 
         try:
             # Step 1: Verify Group Policy Encryption Types
-            import subprocess
             gpo_command = r'(Get-ItemProperty -Path "HKLM:\Software\Policies\Microsoft\Windows\Kerberos\Parameters" -Name "SupportedEncryptionTypes").SupportedEncryptionTypes'
             gpo_result = subprocess.check_output(['powershell.exe', '-Command', gpo_command], text=True).strip()
             print(f"[DEBUG] GPO Encryption Types Value: {gpo_result}")
@@ -534,29 +553,24 @@ def check_ad_misconfigurations(server_url, username, password):
         except Exception as e:
             print(f"[!] Unexpected Error: {e}")
 
+
         # 18. Check 18 DNS Security Assessment (DNSSEC)
-        print("\n[Check 18] Evaluating DNSSEC Implementation for DNS Security...")
+        print("\n[Check 18] Evaluating DNS Security Configuration (DNSSEC)...")
         try:
-            # Get the list of DNS zones
-            zones = subprocess.check_output(['powershell.exe', '-Command', 'Get-DnsServerZone | Select-Object -ExpandProperty ZoneName'], text=True)
-            zones = zones.splitlines()
-
-            if not zones:
-                print("[!] No DNS zones found on the server.")
+            dns_command = ['powershell.exe', '-Command', 'Get-DnsServerZone | Select-Object ZoneName,IsSigned']
+            dns_output = subprocess.check_output(dns_command, text=True)
+            if dns_output:
+                print("[+] DNSSEC Status:")
+                print(dns_output)
+                if "True" in dns_output:
+                    print("[+] DNSSEC is implemented for at least one DNS zone.")
+                else:
+                    print("[!] DNSSEC is not implemented. Consider enabling DNSSEC to prevent DNS spoofing and cache poisoning.")
             else:
-                for zone in zones:
-                    print(f"\n[+] Evaluating DNSSEC for Zone: {zone}")
-                    # Check if DNSSEC is enabled for each zone
-                    dnssec_status = subprocess.check_output(['powershell.exe', '-Command', f'Get-DnsServerDnsSecZoneSetting -ZoneName {zone}'], text=True)
-                    if "ZoneSigningKey" in dnssec_status and "KeyMaster" in dnssec_status:
-                        print(f"[+] DNSSEC is enabled for zone: {zone}")
-                    else:
-                        print(f"[!] DNSSEC is NOT enabled for zone: {zone}")
-
-        except subprocess.CalledProcessError as e:
-            print(f"[!] Error while evaluating DNSSEC: {e}")
+                print("[!] No DNS zones found or unable to retrieve DNSSEC status.")
         except Exception as e:
-            print(f"[!] Unexpected error during DNSSEC assessment: {e}")
+            print(f"[!] Error while evaluating DNSSEC status: {e}")
+
 
         conn.unbind()
 
