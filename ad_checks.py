@@ -571,6 +571,72 @@ def check_ad_misconfigurations(server_url, username, password):
         except Exception as e:
             print(f"[!] Error while evaluating DNSSEC status: {e}")
 
+        
+        # 19. Checking for accounts with DCSync replication privileges 
+        print("\n[Check 19] Checking for accounts with effective DCSync replication privileges...")
+
+        try:
+            # Step 1: Get accounts with explicit replication ACEs on domain root
+            powershell_script = r'''
+            $domainDN = (Get-ADDomain).DistinguishedName
+            $acl = Get-Acl "AD:$domainDN"
+            $acl.Access | Where-Object {
+                $_.ActiveDirectoryRights -match "ReplicatingDirectoryChanges" -or
+                $_.ActiveDirectoryRights -match "ReplicatingDirectoryChangesAll" -or
+                $_.ActiveDirectoryRights -match "ReplicatingDirectoryChangesInFilteredSet"
+            } | Select-Object -Property IdentityReference, ActiveDirectoryRights
+            '''
+
+            result = subprocess.run(
+                ['powershell.exe', '-Command', powershell_script],
+                capture_output=True,
+                text=True
+            )
+
+            if result.returncode != 0:
+                print("[!] Failed to retrieve DCSync ACEs:", result.stderr.strip())
+            else:
+                ace_output = result.stdout.strip()
+                if ace_output:
+                    print("[+] Explicit replication rights found:\n")
+                    for line in ace_output.splitlines():
+                        if "IdentityReference" in line or line.strip() == "":
+                            continue
+                        print("    - " + line.strip())
+                else:
+                    print("[+] No explicit ACEs for replication rights found.")
+
+            # Step 2: Enumerate members of well-known DCSync-capable groups
+            dcsync_groups = ["Domain Admins", "Enterprise Admins", "Administrators", "Backup Operators", "Account Operators"]
+            all_members = []
+
+            for group in dcsync_groups:
+                ps_group_members = f'''
+                Get-ADGroupMember -Identity "{group}" -Recursive | Select-Object -ExpandProperty SamAccountName
+                '''
+                result = subprocess.run(
+                    ['powershell.exe', '-Command', ps_group_members],
+                    capture_output=True,
+                    text=True
+                )
+                members = result.stdout.strip().splitlines() if result.returncode == 0 else []
+                if members:
+                    print(f"\n[+] Members of '{group}' (inherited DCSync rights):")
+                    for user in members:
+                        print(f"    - {user}")
+                        all_members.append(user)
+                else:
+                    print(f"\n[+] No members found in '{group}' or unable to retrieve.")
+
+            if not ace_output and not all_members:
+                print("\n[+] No accounts found with DCSync replication rights (explicit or inherited).")
+
+            else:
+                print("\n[!] Review these accounts carefully. They have effective DCSync capability and can extract credentials from Active Directory.")
+        except Exception as e:
+            print(f"[!] Error during DCSync rights evaluation: {e}")
+
+
 
         conn.unbind()
 
