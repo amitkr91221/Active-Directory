@@ -637,11 +637,54 @@ def check_ad_misconfigurations(server_url, username, password):
             print(f"[!] Error during DCSync rights evaluation: {e}")
 
 
+        # Checking for potential Golden Ticket indicators in Kerberos ticket events
+        print("\n[Check 20] Inspecting Kerberos service ticket requests (Event ID 4769)...")
 
+        try:
+            powershell_script = r'''
+            $events = Get-WinEvent -FilterHashtable @{LogName='Security'; Id=4769} -MaxEvents 100 | ForEach-Object {
+                $event = [xml]$_.ToXml()
+                [PSCustomObject]@{
+                    TimeCreated      = $_.TimeCreated
+                    TargetUserName   = $event.Event.EventData.Data[0].'#text'
+                    ServiceName      = $event.Event.EventData.Data[1].'#text'
+                    TicketEncryption = $event.Event.EventData.Data[9].'#text'
+                    IPAddress        = $event.Event.EventData.Data[18].'#text'
+                }
+            }
+            $events | Sort-Object TimeCreated -Descending | Format-Table -AutoSize
+            '''
+
+            result = subprocess.run(
+                ['powershell.exe', '-Command', powershell_script],
+                capture_output=True,
+                text=True
+            )
+
+            output = result.stdout.strip()
+            error = result.stderr.strip()
+
+            if output:
+                print("[!] Event ID 4769 - Kerberos service ticket requests:\n")
+                print(output)
+                print("\n[!] Review the above manually for anomalies:")
+                print("    🔸 Is the TicketEncryption '0x17'? (RC4-HMAC, used in Mimikatz by default)")
+                print("    🔸 Unusual TargetUserName (e.g., disabled or non-existent)")
+                print("    🔸 Unexpected ServiceName (e.g., krbtgt, cifs, ldap)")
+                print("    🔸 External or unknown IPAddress")
+            elif error:
+                print(f"[!] PowerShell Error:\n{error}")
+            else:
+                print("[+] No Event ID 4769 logs found.")
+
+        except Exception as e:
+            print(f"[!] Error retrieving Event ID 4769 logs: {e}")
         conn.unbind()
 
     except Exception as e:
         print(f"[!] Error: {e}")
+
+    
 
 
 # Main function
